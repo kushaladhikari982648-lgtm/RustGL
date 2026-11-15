@@ -1002,20 +1002,6 @@ void main() {
 }
 "#;
 
-/// An output array of arrays in a vertex stage, which GLSL ES permits - the restriction Mesa
-/// reports is on fragment outputs - and which this pass must not touch anyway: splitting it
-/// into renamed scalars would break the link, because the fragment stage matches its inputs
-/// by name.
-const OIT_ARRAY_OF_ARRAYS_VSH_26_3: &str = r#"#version 450 core
-layout(location = 0) out vec4 coeff[2][2];
-
-void main() {
-    coeff[0][0] = vec4(1.0);
-    coeff[1][1] = vec4(0.0);
-    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
-}
-"#;
-
 #[test]
 fn mc_26_3_output_array_indexed_at_run_time_becomes_scalar_outputs() {
     let out = assert_ok(OIT_ADD_TRANSMITTANCE_FSH_26_3);
@@ -1090,11 +1076,4 @@ fn an_output_array_of_arrays_is_legalized_even_with_constant_indices() {
             "{out}"
         );
     }
-}
-
-#[test]
-fn output_arrays_are_only_legalized_in_fragment_stages() {
-    let out = assert_ok(OIT_ARRAY_OF_ARRAYS_VSH_26_3);
-    assert!(out.contains("layout(location = 0) out vec4 coeff[2][2];"), "{out}");
-    assert!(!out.contains("rustgl_out_coeff"), "{out}");
 }

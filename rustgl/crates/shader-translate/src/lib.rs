@@ -1881,6 +1881,26 @@ pub fn translate_desktop_450(src: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// An output array of arrays in a stage that writes `gl_Position`. GLSL ES rejects the
+    /// shape there too - Mesa says "vertex shader output cannot have an array of arrays" -
+    /// but this pass still leaves it alone: the outputs it substitutes are new names, and a
+    /// vertex output is matched by name by the fragment stage. Fixing a vertex stage needs a
+    /// pass that can rename both sides at once.
+    #[test]
+    fn an_output_array_in_a_vertex_stage_is_left_alone() {
+        let src = "#version 450 core\n\
+layout(location = 0) out vec4 coeff[2][2];\n\
+\n\
+void main() {\n\
+    coeff[0][0] = vec4(1.0);\n\
+    coeff[1][1] = vec4(0.0);\n\
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n\
+}\n";
+        let out = translate(src).expect("a vanilla vertex shader translates");
+        assert!(out.contains("layout(location = 0) out vec4 coeff[2][2];"), "{out}");
+        assert!(!out.contains("rustgl_out_coeff"), "{out}");
+    }
+
     #[test]
     fn derivative_control_functions_compile_as_es_derivatives() {
         let o = translate(
