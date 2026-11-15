@@ -951,3 +951,113 @@ fn iris_330_packs_translate_and_keep_their_outputs() {
     assert!(out.contains("layout(location = 1) out vec4 fragData1;"), "{out}");
     assert!(out.contains("textureLod(gtexture, texCoord,"), "{out}");
 }
+
+/// Minecraft 26.3 `oit_add_transmittance` (fragment stage), reduced to the part that fails.
+/// The coefficient attachments are one array, and the attachment is chosen at run time:
+///
+/// ```glsl
+/// layout(location = 0) out vec4 coeff[OIT_COEFF_ATTACHMENT_COUNT][4];
+/// coeff[attachmentIndex][i] = ...;
+/// ```
+///
+/// GLSL ES allows a constant integral expression only, so Adreno and Mali reject the program
+/// with `S0015` and every pipeline routed through OIT fails. The header comment names the
+/// pipelines that go with it (text, item, entity, clouds, block, particle).
+const OIT_ADD_TRANSMITTANCE_FSH_26_3: &str = r#"#version 450 core
+#define OIT_COEFF_ATTACHMENT_COUNT 2
+
+layout(location = 0) out vec4 coeff[OIT_COEFF_ATTACHMENT_COUNT][4];
+
+uniform int attachmentIndex;
+
+void main() {
+    for (int i = 0; i < 4; ++i) {
+        coeff[attachmentIndex][i] = vec4(float(i));
+    }
+}
+"#;
+
+/// The same array indexed with literals, which GLSL ES already accepts and so must be left
+/// exactly as it is.
+const OIT_CONSTANT_INDEX_FSH_26_3: &str = r#"#version 450 core
+layout(location = 0) out vec4 coeff[2][4];
+
+void main() {
+    for (int i = 0; i < 4; ++i) {
+        coeff[0][i] = vec4(float(i));
+        coeff[1][i] = vec4(0.0);
+    }
+}
+"#;
+
+/// An output array indexed at run time in a vertex stage, where splitting it into renamed
+/// scalars would break the link: the fragment stage matches its inputs by name. The array is
+/// illegal in GLSL ES too, but the answer for it is a different pass, not this one.
+const OIT_DYNAMIC_INDEX_VSH_26_3: &str = r#"#version 450 core
+layout(location = 0) out vec4 coeff[2];
+
+uniform int attachmentIndex;
+
+void main() {
+    coeff[attachmentIndex] = vec4(1.0);
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+}
+"#;
+
+#[test]
+fn mc_26_3_output_array_indexed_at_run_time_becomes_scalar_outputs() {
+    let out = assert_ok(OIT_ADD_TRANSMITTANCE_FSH_26_3);
+
+    // The array stops being an output: it is an ordinary global, which GLSL ES lets a
+    // run-time value index.
+    assert!(out.contains("vec4 coeff[2][4];"), "{out}");
+    assert!(!out.contains("out vec4 coeff["), "{out}");
+
+    // One scalar output per element, holding the locations the array occupied, last index
+    // varying fastest.
+    for flat in 0..8 {
+        assert!(
+            out.contains(&format!(
+                "layout(location = {flat}) out vec4 rustgl_out_coeff_{flat};"
+            )),
+            "{out}"
+        );
+    }
+
+    // Every write to an output now carries a constant index, and main() performs all of them
+    // on the way out.
+    for outer in 0..2 {
+        for inner in 0..4 {
+            let flat = outer * 4 + inner;
+            assert!(
+                out.contains(&format!(
+                    "rustgl_out_coeff_{flat} = coeff[{outer}][{inner}];"
+                )),
+                "{out}"
+            );
+        }
+    }
+
+    // The write the game actually performs is untouched, and the flush follows it.
+    let write = out
+        .find("coeff[attachmentIndex][i]")
+        .unwrap_or_else(|| panic!("the write survives: {out}"));
+    let flush = out
+        .find("rustgl_out_coeff_0 = coeff[0][0];")
+        .unwrap_or_else(|| panic!("the flush runs: {out}"));
+    assert!(write < flush, "the copy-out must follow the writes: {out}");
+}
+
+#[test]
+fn output_arrays_indexed_with_constants_are_left_alone() {
+    let out = assert_ok(OIT_CONSTANT_INDEX_FSH_26_3);
+    assert!(out.contains("layout(location = 0) out vec4 coeff[2][4];"), "{out}");
+    assert!(!out.contains("rustgl_out_coeff"), "{out}");
+}
+
+#[test]
+fn run_time_indexed_outputs_are_only_legalized_in_fragment_stages() {
+    let out = assert_ok(OIT_DYNAMIC_INDEX_VSH_26_3);
+    assert!(out.contains("layout(location = 0) out vec4 coeff[2];"), "{out}");
+    assert!(!out.contains("rustgl_out_coeff"), "{out}");
+}

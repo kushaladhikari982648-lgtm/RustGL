@@ -998,6 +998,383 @@ fn rewrite_frag_data(src: &str, layers: usize) -> String {
     out.replace("gl_FragColor", "rust_FragColor")
 }
 
+// =============================================================================
+// Output arrays indexed at run time
+// =============================================================================
+//
+// Minecraft 26.3 renders translucency through an OIT shader that declares its coefficient
+// attachments as one array and picks the attachment at run time:
+//
+//     layout(location = 0) out vec4 coeff[OIT_COEFF_ATTACHMENT_COUNT][4];
+//     ...
+//     coeff[attachmentIndex][i] = ...;
+//
+// Desktop GL compiles that. GLSL ES does not: an output declared as an array may only be
+// indexed by a constant integral expression, and Adreno and Mali reject the whole program
+// (S0015). Every pipeline that goes through OIT - text, items, entities, clouds, blocks,
+// particles - dies with it, which is the 26.3 black screen.
+//
+// So the array keeps its name and its values but stops being an output: it becomes an
+// ordinary global, and one scalar output per element takes over the locations it occupied.
+// main() copies the array into them on the way out, with a constant index on every write to
+// an output, which is what the driver could not prove before. A run-time index into an
+// ordinary array is legal in GLSL ES.
+//
+// Whatever this cannot do with certainty - a size or a location it cannot read, a main() it
+// cannot find, a name that already means something - leaves the source exactly as it was,
+// which is the behaviour of every build before this one.
+
+/// The largest number of output elements this is willing to generate. A driver has a fixed
+/// number of draw buffers, so an array past this is broken for a reason beyond this pass.
+const MAX_LEGALIZED_OUTPUTS: usize = 32;
+
+/// A fragment output declared as an array that the shader indexes with something other than
+/// a literal.
+struct OutputArray {
+    /// Where the declaration sits in the source's line list.
+    line: usize,
+    ty: String,
+    name: String,
+    /// `[S]` or `[S][T]`; the last index varies fastest, which is the order OpenGL numbers
+    /// the elements in.
+    dims: Vec<usize>,
+    /// Location of element 0.
+    location: usize,
+}
+
+impl OutputArray {
+    fn elements(&self) -> usize {
+        self.dims.iter().product()
+    }
+
+    /// Name of the scalar output taking over element `flat`.
+    fn out_name(&self, flat: usize) -> String {
+        format!("rustgl_out_{}_{}", self.name, flat)
+    }
+
+    /// Subscript and location of element `flat`. OpenGL numbers the elements of an output
+    /// array consecutively with the last index varying fastest, which is exactly the order
+    /// a flattened index walks them in, so the location offset is the flat index itself.
+    fn element(&self, flat: usize) -> (String, usize) {
+        let mut rest = flat;
+        let mut indices = vec![0usize; self.dims.len()];
+        for (depth, dim) in self.dims.iter().enumerate().rev() {
+            indices[depth] = rest % dim;
+            rest /= dim;
+        }
+        let mut subscript = String::new();
+        for index in indices {
+            subscript.push_str(&format!("[{index}]"));
+        }
+        (subscript, self.location + flat)
+    }
+
+    /// `rustgl_out_coeff_3 = coeff[0][3];`
+    fn flush_assignment(&self, flat: usize) -> String {
+        let (subscript, _) = self.element(flat);
+        format!("{} = {}{};", self.out_name(flat), self.name, subscript)
+    }
+
+    /// What replaces the declaration: an ordinary global of the same name and type, then one
+    /// scalar output per element. Kept on a single line so every line after it keeps the
+    /// number the driver will report an error against.
+    fn replacement(&self) -> String {
+        let mut dims = String::new();
+        for dim in &self.dims {
+            dims.push_str(&format!("[{dim}]"));
+        }
+        let mut out = format!("{} {}{};", self.ty, self.name, dims);
+        for flat in 0..self.elements() {
+            let (_, location) = self.element(flat);
+            out.push_str(&format!(
+                " layout(location = {location}) out {} {};",
+                self.ty,
+                self.out_name(flat)
+            ));
+        }
+        out
+    }
+}
+
+/// Integer values of `#define NAME <integer>` macros. A shader sizes an array with a macro
+/// more often than with a literal, and the game's preprocessor does not expand it: 26.3's
+/// OIT shader writes `coeff[OIT_COEFF_ATTACHMENT_COUNT]`.
+fn macro_int_values(src: &str) -> std::collections::HashMap<&str, usize> {
+    let mut out = std::collections::HashMap::new();
+    for line in src.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("#define") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let name = parts.next().unwrap_or("");
+        let value = parts.next().unwrap_or("");
+        // Function-like macros (`#define MAX(a,b) ...`) name nothing that sizes an array.
+        if name.is_empty() || name.contains('(') || parts.next().is_some() {
+            continue;
+        }
+        if let Ok(n) = value.parse::<usize>() {
+            out.insert(name, n);
+        }
+    }
+    out
+}
+
+/// Literal or macro: the only two spellings of an array size this can act on.
+fn resolve_size(text: &str, macros: &std::collections::HashMap<&str, usize>) -> Option<usize> {
+    let text = text.trim();
+    text.parse::<usize>().ok().or_else(|| macros.get(text).copied())
+}
+
+/// Splits `coeff[2][4]` into its identifier and its dimensions.
+fn parse_array_declarator<'a>(
+    word: &'a str,
+    macros: &std::collections::HashMap<&str, usize>,
+) -> Option<(&'a str, Vec<usize>)> {
+    let end = word
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(word.len());
+    if end == 0 || !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return None;
+    }
+    let (name, mut rest) = word.split_at(end);
+    let mut dims = Vec::new();
+    while let Some(inner) = rest.strip_prefix('[') {
+        let close = inner.find(']')?;
+        let size = resolve_size(&inner[..close], macros)?;
+        if size == 0 {
+            return None;
+        }
+        dims.push(size);
+        rest = &inner[close + 1..];
+    }
+    if !rest.is_empty() || dims.is_empty() || dims.len() > 2 {
+        return None;
+    }
+    if dims.iter().product::<usize>() > MAX_LEGALIZED_OUTPUTS {
+        return None;
+    }
+    Some((name, dims))
+}
+
+/// Byte offset of the `)` closing the `(` at the start of `s`, if there is one.
+fn matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reads a global `out <type> <name>[S]` (or `[S][T]`) declaration and its location.
+///
+/// Anything else - a second declarator, an initialiser, a location this cannot read - is
+/// left for the driver rather than half-rewritten.
+fn parse_output_array_decl(
+    line: &str,
+    macros: &std::collections::HashMap<&str, usize>,
+) -> Option<(String, String, Vec<usize>, usize)> {
+    let mut rest = line.trim().strip_suffix(';')?;
+    let mut location = None::<usize>;
+    if let Some(after) = rest.trim_start().strip_prefix("layout") {
+        let after = after.trim_start();
+        if !after.starts_with('(') {
+            return None;
+        }
+        let close = matching_paren(after)?;
+        for part in after[1..close].split(',') {
+            let mut halves = part.split('=');
+            let key = halves.next()?.trim();
+            let value = halves.next()?.trim();
+            if halves.next().is_some() {
+                continue;
+            }
+            if key == "location" {
+                location = resolve_size(value, macros);
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    let mut words: Vec<&str> = rest.split_whitespace().collect();
+    loop {
+        let is_qualifier = words.first().is_some_and(|w| {
+            matches!(
+                *w,
+                "flat"
+                    | "smooth"
+                    | "noperspective"
+                    | "centroid"
+                    | "sample"
+                    | "invariant"
+                    | "precise"
+            )
+        });
+        if !is_qualifier {
+            break;
+        }
+        words.remove(0);
+    }
+    if words.len() != 3 || words[0] != "out" || !is_glsl_type(words[1]) {
+        return None;
+    }
+    let (name, dims) = parse_array_declarator(words[2], macros)?;
+    Some((words[1].to_string(), name.to_string(), dims, location?))
+}
+
+/// Whether `name` is subscripted by anything other than a literal anywhere outside its own
+/// declaration. A loop counter counts as dynamic here: legalising it changes nothing about
+/// what the shader computes, and proving a loop is well formed is not this pass's job.
+fn dynamically_indexed(lines: &[&str], name: &str, declaration_line: usize) -> bool {
+    for (index, line) in lines.iter().enumerate() {
+        if index == declaration_line {
+            continue;
+        }
+        for (at, _) in line.match_indices(name) {
+            let bytes = line.as_bytes();
+            if at > 0 && is_ident_byte(bytes[at - 1]) {
+                continue; // a longer identifier that merely ends with this name
+            }
+            let after = at + name.len();
+            if !line[after..].starts_with('[') {
+                continue;
+            }
+            let open = after + 1;
+            let Some(close) = line[open..].find(']') else {
+                continue;
+            };
+            if line[open..open + close].trim().parse::<usize>().is_err() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// First and last line of `main()`, by counting braces from the line that declares it.
+fn main_span(lines: &[&str]) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|line| {
+        line.match_indices("main(")
+            .any(|(at, _)| at == 0 || !is_ident_byte(line.as_bytes()[at - 1]))
+    })?;
+    let mut depth = 0isize;
+    let mut entered = false;
+    for (offset, line) in lines[start..].iter().enumerate() {
+        for c in line.chars() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    entered = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if entered && depth <= 0 {
+            return Some((start, start + offset));
+        }
+    }
+    None
+}
+
+/// A bare `return;` in `main()`, rewritten so the copy-out runs first. Braced, so the result
+/// is a statement wherever the return happened to sit.
+fn return_with_flush(line: &str, flush: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("return")?.trim_start();
+    if rest != ";" {
+        return None;
+    }
+    let indent = &line[..line.len() - line.trim_start().len()];
+    Some(format!("{indent}{{ {flush} return; }}"))
+}
+
+/// Makes an output array that is indexed at run time legal in GLSL ES.
+fn legalize_output_arrays(src: &str) -> Cow<'_, str> {
+    let macros = macro_int_values(src);
+    let lines: Vec<&str> = src.lines().collect();
+
+    let mut arrays: Vec<OutputArray> = Vec::new();
+    let mut depth = 0isize;
+    for (index, line) in lines.iter().enumerate() {
+        // Only at global scope: the same text inside a function is a local array, which GLSL
+        // ES already allows a run-time index into.
+        if depth == 0 {
+            if let Some((ty, name, dims, location)) = parse_output_array_decl(line, &macros) {
+                if dynamically_indexed(&lines, &name, index) {
+                    arrays.push(OutputArray {
+                        line: index,
+                        ty,
+                        name,
+                        dims,
+                        location,
+                    });
+                }
+            }
+        }
+        for c in line.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    if arrays.is_empty() {
+        return Cow::Borrowed(src);
+    }
+    // A generated name that already means something would silently change what the shader
+    // says, so this shader is left alone instead.
+    let collides = arrays.iter().any(|array| {
+        (0..array.elements()).any(|flat| contains_identifier(src, &array.out_name(flat)))
+    });
+    if collides {
+        return Cow::Borrowed(src);
+    }
+    // Without a main() there is nowhere to copy the array out, and a half-rewritten shader
+    // would render nothing at all.
+    let Some((main_start, main_end)) = main_span(&lines) else {
+        return Cow::Borrowed(src);
+    };
+
+    let mut flush_parts = Vec::new();
+    for array in &arrays {
+        for flat in 0..array.elements() {
+            flush_parts.push(array.flush_assignment(flat));
+        }
+    }
+    let flush = flush_parts.join(" ");
+
+    let mut out = String::with_capacity(src.len() + 512);
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(array) = arrays.iter().find(|array| array.line == index) {
+            out.push_str(&array.replacement());
+            out.push('\n');
+            continue;
+        }
+        if index == main_end {
+            out.push_str(&flush);
+            out.push('\n');
+        }
+        if index >= main_start && index <= main_end {
+            if let Some(replaced) = return_with_flush(line, &flush) {
+                out.push_str(&replaced);
+                out.push('\n');
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Cow::Owned(out)
+}
+
 fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
         1
@@ -1333,6 +1710,18 @@ pub fn translate_with_texture_buffers(src: &str, texture_buffers: TextureBufferS
     let needs_frag_out = use_300 && layers > 0;
     let rewrite_ftransform = !declares_ftransform(src);
     let uses_point_size = src.contains("gl_PointSize");
+    // Minecraft 26.3 indexes an output array with a value only known at run time, which
+    // GLSL ES rejects outright (S0015). Fragment stages only, on two counts: a location on
+    // an output is an ES 3.00 feature of fragment outputs, and the scalar outputs this pass
+    // substitutes in are new names, which a vertex shader cannot do - the fragment stage
+    // matches its inputs by name. `is_frag` alone is not enough, because it counts any `out`
+    // declaration that is not gl_Position, so gl_Position is what rules a vertex stage out.
+    let legalized = if use_300 && is_frag && !src.contains("gl_Position") {
+        legalize_output_arrays(src)
+    } else {
+        Cow::Borrowed(src)
+    };
+    let src: &str = legalized.as_ref();
 
     let mut out = String::with_capacity(src.len() + 512);
     out.push_str(header);
