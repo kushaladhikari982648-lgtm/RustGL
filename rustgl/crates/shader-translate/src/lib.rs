@@ -1028,8 +1028,8 @@ fn rewrite_frag_data(src: &str, layers: usize) -> String {
 /// number of draw buffers, so an array past this is broken for a reason beyond this pass.
 const MAX_LEGALIZED_OUTPUTS: usize = 32;
 
-/// A fragment output declared as an array that the shader indexes with something other than
-/// a literal.
+/// A fragment output declared as an array that GLSL ES will not accept as it stands: either
+/// the shader indexes it with something other than a literal, or it is an array of arrays.
 struct OutputArray {
     /// Where the declaration sits in the source's line list.
     line: usize,
@@ -1307,7 +1307,12 @@ fn legalize_output_arrays(src: &str) -> Cow<'_, str> {
         // ES already allows a run-time index into.
         if depth == 0 {
             if let Some((ty, name, dims, location)) = parse_output_array_decl(line, &macros) {
-                if dynamically_indexed(&lines, &name, index) {
+                // Two ways an output array is illegal. The first is the one 26.3 hits: a
+                // run-time index. The second is the shape itself - Mesa refuses
+                // `out vec4 coeff[2][4]` with "fragment shader output cannot have an array
+                // of arrays" even when every index is a literal, so a constant index does
+                // not make an array of arrays safe to leave alone.
+                if dims.len() > 1 || dynamically_indexed(&lines, &name, index) {
                     arrays.push(OutputArray {
                         line: index,
                         ty,

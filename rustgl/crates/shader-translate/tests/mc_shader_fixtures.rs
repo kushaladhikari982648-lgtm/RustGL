@@ -980,6 +980,18 @@ void main() {
 /// The same array indexed with literals, which GLSL ES already accepts and so must be left
 /// exactly as it is.
 const OIT_CONSTANT_INDEX_FSH_26_3: &str = r#"#version 450 core
+layout(location = 0) out vec4 coeff[2];
+
+void main() {
+    coeff[0] = vec4(1.0);
+    coeff[1] = vec4(0.0);
+}
+"#;
+
+/// An output array of arrays indexed with literals. Mesa's verdict on the shape, whatever
+/// indexes it, is `fragment shader output cannot have an array of arrays`, so this one has to
+/// be legalized like the run-time case rather than left alone.
+const OIT_ARRAY_OF_ARRAYS_FSH_26_3: &str = r#"#version 450 core
 layout(location = 0) out vec4 coeff[2][4];
 
 void main() {
@@ -990,16 +1002,16 @@ void main() {
 }
 "#;
 
-/// An output array indexed at run time in a vertex stage, where splitting it into renamed
-/// scalars would break the link: the fragment stage matches its inputs by name. The array is
-/// illegal in GLSL ES too, but the answer for it is a different pass, not this one.
-const OIT_DYNAMIC_INDEX_VSH_26_3: &str = r#"#version 450 core
-layout(location = 0) out vec4 coeff[2];
-
-uniform int attachmentIndex;
+/// An output array of arrays in a vertex stage, which GLSL ES permits - the restriction Mesa
+/// reports is on fragment outputs - and which this pass must not touch anyway: splitting it
+/// into renamed scalars would break the link, because the fragment stage matches its inputs
+/// by name.
+const OIT_ARRAY_OF_ARRAYS_VSH_26_3: &str = r#"#version 450 core
+layout(location = 0) out vec4 coeff[2][2];
 
 void main() {
-    coeff[attachmentIndex] = vec4(1.0);
+    coeff[0][0] = vec4(1.0);
+    coeff[1][1] = vec4(0.0);
     gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
 }
 "#;
@@ -1051,13 +1063,38 @@ fn mc_26_3_output_array_indexed_at_run_time_becomes_scalar_outputs() {
 #[test]
 fn output_arrays_indexed_with_constants_are_left_alone() {
     let out = assert_ok(OIT_CONSTANT_INDEX_FSH_26_3);
-    assert!(out.contains("layout(location = 0) out vec4 coeff[2][4];"), "{out}");
+    assert!(out.contains("layout(location = 0) out vec4 coeff[2];"), "{out}");
     assert!(!out.contains("rustgl_out_coeff"), "{out}");
 }
 
 #[test]
-fn run_time_indexed_outputs_are_only_legalized_in_fragment_stages() {
-    let out = assert_ok(OIT_DYNAMIC_INDEX_VSH_26_3);
-    assert!(out.contains("layout(location = 0) out vec4 coeff[2];"), "{out}");
+fn an_output_array_of_arrays_is_legalized_even_with_constant_indices() {
+    let out = assert_ok(OIT_ARRAY_OF_ARRAYS_FSH_26_3);
+    // The shape is the problem, not the index: an array of arrays cannot be a fragment
+    // output at all.
+    assert!(out.contains("vec4 coeff[2][4];"), "{out}");
+    assert!(!out.contains("out vec4 coeff["), "{out}");
+    for flat in 0..8 {
+        assert!(
+            out.contains(&format!(
+                "layout(location = {flat}) out vec4 rustgl_out_coeff_{flat};"
+            )),
+            "{out}"
+        );
+        let outer = flat / 4;
+        let inner = flat % 4;
+        assert!(
+            out.contains(&format!(
+                "rustgl_out_coeff_{flat} = coeff[{outer}][{inner}];"
+            )),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn output_arrays_are_only_legalized_in_fragment_stages() {
+    let out = assert_ok(OIT_ARRAY_OF_ARRAYS_VSH_26_3);
+    assert!(out.contains("layout(location = 0) out vec4 coeff[2][2];"), "{out}");
     assert!(!out.contains("rustgl_out_coeff"), "{out}");
 }
