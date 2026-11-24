@@ -1284,15 +1284,79 @@ fn main_span(lines: &[&str]) -> Option<(usize, usize)> {
     None
 }
 
-/// A bare `return;` in `main()`, rewritten so the copy-out runs first. Braced, so the result
-/// is a statement wherever the return happened to sit.
-fn return_with_flush(line: &str, flush: &str) -> Option<String> {
-    let rest = line.trim_start().strip_prefix("return")?.trim_start();
-    if rest != ";" {
-        return None;
+/// Inserts the copy-out before every bare `return;` in a main-body line, including an inline
+/// branch such as `if (skip) return;`. The tiny scanner skips comments and quoted text so it
+/// does not turn an explanatory comment into executable code. `in_block_comment` carries
+/// state across the shader's physical lines.
+fn flush_before_main_returns(
+    line: &str,
+    flush: &str,
+    rewrite: bool,
+    in_block_comment: &mut bool,
+) -> String {
+    let bytes = line.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() + if rewrite { flush.len() + 16 } else { 0 });
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if *in_block_comment {
+            if bytes[i..].starts_with(b"*/") {
+                out.extend_from_slice(b"*/");
+                i += 2;
+                *in_block_comment = false;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"//") {
+            out.extend_from_slice(&bytes[i..]);
+            break;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            out.extend_from_slice(b"/*");
+            i += 2;
+            *in_block_comment = true;
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            out.push(bytes[i]);
+            i += 1;
+            while i < bytes.len() {
+                let byte = bytes[i];
+                out.push(byte);
+                i += 1;
+                if byte == b'\\' && i < bytes.len() {
+                    out.push(bytes[i]);
+                    i += 1;
+                } else if byte == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+        if rewrite
+            && bytes[i..].starts_with(b"return")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (i + 6 == bytes.len() || !is_ident_byte(bytes[i + 6]))
+        {
+            let mut end = i + 6;
+            while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+                end += 1;
+            }
+            if bytes.get(end) == Some(&b';') {
+                out.extend_from_slice(b"{ ");
+                out.extend_from_slice(flush.as_bytes());
+                out.extend_from_slice(b" return; }");
+                i = end + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
-    let indent = &line[..line.len() - line.trim_start().len()];
-    Some(format!("{indent}{{ {flush} return; }}"))
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Makes an output array that is indexed at run time legal in GLSL ES.
@@ -1357,7 +1421,15 @@ fn legalize_output_arrays(src: &str) -> Cow<'_, str> {
     let flush = flush_parts.join(" ");
 
     let mut out = String::with_capacity(src.len() + 512);
+    let mut in_block_comment = false;
     for (index, line) in lines.iter().enumerate() {
+        let in_main = index >= main_start && index <= main_end;
+        let rewritten_line = flush_before_main_returns(
+            line,
+            &flush,
+            in_main,
+            &mut in_block_comment,
+        );
         if let Some(array) = arrays.iter().find(|array| array.line == index) {
             out.push_str(&array.replacement());
             out.push('\n');
@@ -1367,14 +1439,7 @@ fn legalize_output_arrays(src: &str) -> Cow<'_, str> {
             out.push_str(&flush);
             out.push('\n');
         }
-        if index >= main_start && index <= main_end {
-            if let Some(replaced) = return_with_flush(line, &flush) {
-                out.push_str(&replaced);
-                out.push('\n');
-                continue;
-            }
-        }
-        out.push_str(line);
+        out.push_str(if in_main { &rewritten_line } else { line });
         out.push('\n');
     }
     Cow::Owned(out)
@@ -1430,7 +1495,12 @@ fn has_fragment_outputs(src: &str) -> bool {
 }
 
 fn looks_like_compute(src: &str) -> bool {
-    src.contains("layout(local_size")
+    // GLSL permits whitespace between `layout` and `(`, and desktop compilers commonly
+    // format the local-size declaration as `layout (local_size_x = ...)`. Looking for the
+    // qualifier itself catches both spellings without mistaking unrelated `layout(...)`.
+    src.contains("local_size_x")
+        || src.contains("local_size_y")
+        || src.contains("local_size_z")
         || src.contains("#extension GL_ARB_compute_shader")
         || src.contains("#extension GL_ES_compute")
 }
@@ -1617,11 +1687,29 @@ pub fn translate(src: &str) -> Result<String, String> {
 
 /// The GL driver determines this capability; never infer it from the Java or GLSL version.
 pub fn translate_with_texture_buffers(src: &str, texture_buffers: TextureBufferSupport) -> Result<String, String> {
+    // Preserve the historical API's conservative target. The GL bridge uses the explicit
+    // driver-version entry point below so ES 3.1 compute support does not get guessed.
+    translate_for_gles(src, texture_buffers, (3, 0))
+}
+
+/// Translates desktop GLSL for the actual GLES context. Compute shaders are core in GLES
+/// 3.1; rejecting them unconditionally made every game pipeline that uses compute fail even
+/// on Mali, Adreno and PowerVR devices whose driver supports the feature. Geometry and
+/// tessellation remain unsupported by this passthrough translator.
+pub fn translate_for_gles(
+    src: &str,
+    texture_buffers: TextureBufferSupport,
+    target_es: (u32, u32),
+) -> Result<String, String> {
     if looks_like_geometry_or_tess(src) {
         return Err("geometry/tessellation shaders are not supported on GLES passthrough".into());
     }
-    if looks_like_compute(src) {
-        return Err("compute shaders are not supported on GLES passthrough".into());
+    let is_compute = looks_like_compute(src);
+    if is_compute && target_es < (3, 1) {
+        return Err(format!(
+            "compute shaders require GLES 3.1; driver reports GLES {}.{}",
+            target_es.0, target_es.1
+        ));
     }
 
     let mut version: Option<(u32, bool)> = None;
@@ -1661,7 +1749,7 @@ pub fn translate_with_texture_buffers(src: &str, texture_buffers: TextureBufferS
     // `#version 120` shader (the OptiFine/Iris era, and Minecraft 1.12-1.15) to ES 1.00 --
     // where `layout(location = N) out` is not valid GLSL, so every MRT shader failed to
     // compile. ES 3.00 also accepts everything ES 1.00 did, so this is strictly broader.
-    let use_300 = num >= 110;
+    let use_300 = target_es >= (3, 0) && num >= 110;
     let uses_buffer = src.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|word| matches!(word, "samplerBuffer" | "isamplerBuffer" | "usamplerBuffer"));
     if uses_buffer && texture_buffers == TextureBufferSupport::None {
@@ -1669,11 +1757,15 @@ pub fn translate_with_texture_buffers(src: &str, texture_buffers: TextureBufferS
     }
     // GLSL ES requires matching language versions at link time. Use the same
     // context-selected dialect even for a stage that does not itself use buffers.
-    let header = match texture_buffers {
-        TextureBufferSupport::Core32 => "#version 320 es",
-        TextureBufferSupport::Ext31 | TextureBufferSupport::Oes31 => "#version 310 es",
-        TextureBufferSupport::None if use_300 => "#version 300 es",
-        _ => "#version 100",
+    let header = if is_compute {
+        if target_es >= (3, 2) { "#version 320 es" } else { "#version 310 es" }
+    } else {
+        match texture_buffers {
+            TextureBufferSupport::Core32 => "#version 320 es",
+            TextureBufferSupport::Ext31 | TextureBufferSupport::Oes31 => "#version 310 es",
+            TextureBufferSupport::None if use_300 => "#version 300 es",
+            _ => "#version 100",
+        }
     };
     let buffer_extension = if uses_buffer {
         match texture_buffers {
@@ -1721,7 +1813,7 @@ pub fn translate_with_texture_buffers(src: &str, texture_buffers: TextureBufferS
     // substitutes in are new names, which a vertex shader cannot do - the fragment stage
     // matches its inputs by name. `is_frag` alone is not enough, because it counts any `out`
     // declaration that is not gl_Position, so gl_Position is what rules a vertex stage out.
-    let legalized = if use_300 && is_frag && !src.contains("gl_Position") {
+    let legalized = if use_300 && is_frag && !is_compute && !src.contains("gl_Position") {
         legalize_output_arrays(src)
     } else {
         Cow::Borrowed(src)
@@ -1751,10 +1843,10 @@ pub fn translate_with_texture_buffers(src: &str, texture_buffers: TextureBufferS
     if needs_frag_out {
         out.push_str(&fragment_output_decls(layers));
     }
-    if use_300 && uses_point_size && !is_frag {
+    if use_300 && uses_point_size && !is_frag && !is_compute {
         out.push_str("out float gl_PointSize;\n");
     }
-    if use_300 && !is_frag {
+    if use_300 && !is_frag && !is_compute {
         let uses_ftransform = src.contains("ftransform()") && !declares_ftransform(src);
         let decls = legacy_builtin_decls(src, uses_ftransform);
         if !decls.is_empty() {
@@ -1899,6 +1991,24 @@ void main() {\n\
         let out = translate(src).expect("a vanilla vertex shader translates");
         assert!(out.contains("layout(location = 0) out vec4 coeff[2][2];"), "{out}");
         assert!(!out.contains("rustgl_out_coeff"), "{out}");
+    }
+
+    #[test]
+    fn compute_shaders_require_es_31_and_translate_to_the_context_language_version() {
+        let src = "#version 430 core\n\
+layout (local_size_x = 8, local_size_y = 1, local_size_z = 1) in;\n\
+layout(std430, binding = 0) buffer Data { uint values[]; };\n\
+void main() { uint i = gl_GlobalInvocationID.x; values[i] = i; }\n";
+        let out = translate_for_gles(src, TextureBufferSupport::None, (3, 1)).unwrap();
+        assert!(out.starts_with("#version 310 es\n"), "{out}");
+        assert!(out.contains("layout (local_size_x = 8, local_size_y = 1, local_size_z = 1) in;"), "{out}");
+        assert!(out.contains("layout(std430) buffer Data"), "{out}");
+        assert!(out.contains("gl_GlobalInvocationID.x"), "{out}");
+        assert!(!out.contains("rust_gl_Vertex"), "compute stages must not get vertex attributes: {out}");
+        assert!(translate_for_gles(src, TextureBufferSupport::None, (3, 0)).is_err());
+
+        let es32 = translate_for_gles(src, TextureBufferSupport::Core32, (3, 2)).unwrap();
+        assert!(es32.starts_with("#version 320 es\n"), "{es32}");
     }
 
     #[test]

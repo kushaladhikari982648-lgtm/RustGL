@@ -15,7 +15,7 @@
 //! establish the cause of a device-specific blank screen. The GLES smoke test also compiles
 //! these fixtures on a real driver rather than relying only on text assertions.
 
-use shader_translate::translate;
+use shader_translate::{translate, translate_for_gles, TextureBufferSupport};
 
 fn assert_ok(src: &str) -> String {
     match translate(src) {
@@ -952,6 +952,35 @@ fn iris_330_packs_translate_and_keep_their_outputs() {
     assert!(out.contains("textureLod(gtexture, texCoord,"), "{out}");
 }
 
+/// Minecraft 26.x compute-stage shape: desktop GLSL 4.30 with a workgroup declaration and
+/// an SSBO. On GLES 3.1 these are core, and must not be rejected just because the source is
+/// a compute shader.
+const MC26_COMPUTE_CSH: &str = r#"#version 430 core
+layout (local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) buffer Data { uint values[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    values[i] = i;
+}
+"#;
+
+#[test]
+fn compute_shaders_use_the_reported_gles_tier() {
+    let translated = translate_for_gles(MC26_COMPUTE_CSH, TextureBufferSupport::None, (3, 1))
+        .expect("GLES 3.1 has core compute shaders");
+    assert!(translated.starts_with("#version 310 es\n"), "{translated}");
+    assert!(translated.contains("layout (local_size_x = 8"), "{translated}");
+    assert!(translated.contains("layout(std430) buffer Data"), "{translated}");
+    assert!(translated.contains("gl_GlobalInvocationID.x"), "{translated}");
+    assert!(!translated.contains("rust_gl_Vertex"), "{translated}");
+
+    let translated = translate_for_gles(MC26_COMPUTE_CSH, TextureBufferSupport::Core32, (3, 2))
+        .expect("GLES 3.2 has core compute shaders");
+    assert!(translated.starts_with("#version 320 es\n"), "{translated}");
+    assert!(translate(MC26_COMPUTE_CSH).is_err(), "ES 3.0 must not be given ES 3.1 compute");
+}
+
 /// Minecraft 26.3 `oit_add_transmittance` (fragment stage), reduced to the part that fails.
 /// The coefficient attachments are one array, and the attachment is chosen at run time:
 ///
@@ -971,6 +1000,7 @@ layout(location = 0) out vec4 coeff[OIT_COEFF_ATTACHMENT_COUNT][4];
 uniform int attachmentIndex;
 
 void main() {
+    if (attachmentIndex < 0) return;
     for (int i = 0; i < 4; ++i) {
         coeff[attachmentIndex][i] = vec4(float(i));
     }
@@ -1036,14 +1066,18 @@ fn mc_26_3_output_array_indexed_at_run_time_becomes_scalar_outputs() {
         }
     }
 
-    // The write the game actually performs is untouched, and the flush follows it.
+    // The dynamic write is untouched; the copy-out runs both before the early return and
+    // again at the normal end of main().
     let write = out
         .find("coeff[attachmentIndex][i]")
         .unwrap_or_else(|| panic!("the write survives: {out}"));
-    let flush = out
-        .find("rustgl_out_coeff_0 = coeff[0][0];")
-        .unwrap_or_else(|| panic!("the flush runs: {out}"));
-    assert!(write < flush, "the copy-out must follow the writes: {out}");
+    let early_return = out
+        .find("if (attachmentIndex < 0) { rustgl_out_coeff_0 = coeff[0][0];")
+        .unwrap_or_else(|| panic!("the early return must flush outputs: {out}"));
+    let final_flush = out
+        .rfind("rustgl_out_coeff_0 = coeff[0][0];")
+        .unwrap_or_else(|| panic!("the normal exit must flush outputs: {out}"));
+    assert!(early_return < write && write < final_flush, "flush order is wrong: {out}");
 }
 
 #[test]

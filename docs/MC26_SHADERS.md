@@ -18,6 +18,28 @@ translation layer:
 The failure mode is not subtle: the program fails to compile, the pipeline is dropped, and
 whatever that pipeline drew is simply missing.
 
+## Compute shaders on GLES 3.1 and 3.2
+
+This renderer used to reject every compute shader, even when the actual GLES context was
+3.1 or 3.2 and had core compute support. A game that selected a compute pipeline from the
+reported desktop-GL version then got a deliberately failed shader, which could leave later
+rendering stages blank.
+
+The translator now uses the **driver's actual GLES version**:
+
+| Driver | Compute shader output |
+| --- | --- |
+| GLES 3.2 | `#version 320 es` |
+| GLES 3.1 | `#version 310 es` |
+| GLES 3.0 or older | rejected with a clear translation log; the renderer does not send an unsupported compute shader to the driver |
+
+This handles the common desktop-GL compute shape (workgroup size, SSBOs, and built-in
+`gl_GlobalInvocationID`) by translating the source dialect and preserving the compute-stage
+layout. It does not turn ES 3.0 hardware into an ES 3.1 device, and it does not claim that all
+GL 4.x compute extensions or every desktop compute feature exist on every mobile driver.
+The GLES smoke test compiles a desktop GLSL 4.30 workgroup/SSBO fixture on Mesa GLES 3.2 and
+3.1; Mali, Adreno and PowerVR device validation is still required.
+
 ## Output arrays indexed at run time — fixed
 
 26.3's OIT (order-independent transparency) shader declares its coefficient attachments as one
@@ -120,3 +142,5 @@ EGL). The three 26.3 fixtures are:
 That is a driver compiling the rewritten output, not a text assertion. It is one driver, on one
 implementation of GLSL ES; Adreno and Mali enforce the same rules with different words, and the
 only way to confirm those is on the device.
+
+The shader translation cache key includes the measured GLES version, not only texture-buffer support, so a translation produced for one GLES tier cannot be reused for another.

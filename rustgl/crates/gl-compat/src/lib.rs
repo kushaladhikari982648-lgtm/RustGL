@@ -1207,21 +1207,29 @@ const SHADER_TRANSLATION_ENTRIES: usize = 128;
 const SHADER_TRANSLATION_BYTES: usize = 2 * 1024 * 1024;
 const SHADER_TRANSLATION_MAX_SOURCE: usize = 512 * 1024;
 
-/// (fingerprint, source length, target) - `target` packs the ES flag in bit 7 and the
-/// texture-buffer support in bits 0-3.
-type ShaderTranslationKey = (u64, usize, u8);
+/// (fingerprint, source length, target) - `target` packs the ES flag, measured GLES
+/// major/minor, and texture-buffer support so a shader translated for ES 3.1 cannot be
+/// reused on ES 3.0 or ES 3.2.
+type ShaderTranslationKey = (u64, usize, u16);
 static SHADER_TRANSLATIONS: RwLock<Option<Vec<(ShaderTranslationKey, String)>>> = RwLock::new(None);
 
-fn shader_translation_target(is_es: bool, texture_buffers: u8) -> u8 {
-    (if is_es { 0x80 } else { 0x00 }) | (texture_buffers & 0x7f)
+fn shader_translation_target(
+    is_es: bool,
+    texture_buffers: u8,
+    es_version: (u32, u32),
+) -> u16 {
+    let api = if is_es { 1u16 << 15 } else { 0 };
+    let major = ((es_version.0.min(15) as u16) & 0x0f) << 8;
+    let minor = ((es_version.1.min(15) as u16) & 0x0f) << 4;
+    api | major | minor | (texture_buffers as u16 & 0x0f)
 }
 
-fn shader_translation_key(src: &str, target: u8) -> ShaderTranslationKey {
+fn shader_translation_key(src: &str, target: u16) -> ShaderTranslationKey {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = DefaultHasher::new();
     hasher.write(src.as_bytes());
-    hasher.write_u8(target);
+    hasher.write_u16(target);
     (hasher.finish(), src.len(), target)
 }
 
@@ -1282,14 +1290,16 @@ pub unsafe extern "C" fn glShaderSource(
         src.push_str(&String::from_utf8_lossy(bytes));
     }
     let is_es = shader_translation_is_es();
-    let support = gles3::texture_buffer_support(&gles3::caps());
-    let target = shader_translation_target(is_es, support as u8);
+    let caps = gles3::caps();
+    let support = gles3::texture_buffer_support(&caps);
+    let es_version = if caps.valid { (caps.es_major, caps.es_minor) } else { (3, 0) };
+    let target = shader_translation_target(is_es, support as u8, es_version);
     let key = shader_translation_key(&src, target);
     let translated = match cached_shader_translation(&key) {
         Some(translated) => translated,
         None => {
             let translated = if is_es {
-                shader_translate::translate_with_texture_buffers(&src, support)
+                shader_translate::translate_for_gles(&src, support, es_version)
             } else {
                 shader_translate::translate_desktop_450(&src)
             };
@@ -4936,6 +4946,13 @@ mod tests {
         assert_eq!(map_default_framebuffer_buffer(0, true, 0), 0); // GL_NONE
         assert_eq!(map_default_framebuffer_buffer(GL_BACK, true, 0), GL_BACK);
         assert_eq!(map_default_framebuffer_buffer(0x8CE0, true, 0), 0x8CE0); // GL_COLOR_ATTACHMENT0
+    }
+
+    #[test]
+    fn shader_translation_cache_key_includes_measured_gles_version() {
+        assert_ne!(shader_translation_target(true, 0, (3, 0)), shader_translation_target(true, 0, (3, 1)));
+        assert_ne!(shader_translation_target(true, 0, (3, 1)), shader_translation_target(true, 0, (3, 2)));
+        assert_ne!(shader_translation_target(true, 0, (3, 2)), shader_translation_target(false, 0, (3, 2)));
     }
 
     #[test]
